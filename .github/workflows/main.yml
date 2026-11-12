@@ -1,3 +1,4 @@
+
 name: RDP
 
 on:
@@ -5,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   pc-virtual:
@@ -12,31 +14,92 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Restaurar downloads anteriores
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $downloads = "$env:USERPROFILE\Downloads"
+          $temp = "$env:RUNNER_TEMP\pc-restore"
+
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          New-Item -ItemType Directory -Force -Path $temp | Out-Null
+
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $repo = $env:GITHUB_REPOSITORY
+          $url = "https://api.github.com/repos/$repo/actions/artifacts?name=pc-virtual-downloads&per_page=100"
+
+          try {
+            $result = Invoke-RestMethod -Uri $url -Headers $headers
+
+            $artifact = $result.artifacts |
+              Where-Object {
+                $_.name -eq "pc-virtual-downloads" -and
+                -not $_.expired -and
+                $_.workflow_run.id -ne [long]$env:GITHUB_RUN_ID
+              } |
+              Sort-Object created_at -Descending |
+              Select-Object -First 1
+
+            if ($artifact) {
+              $archive = "$temp\backup.zip"
+
+              Invoke-WebRequest `
+                -Uri $artifact.archive_download_url `
+                -Headers $headers `
+                -OutFile $archive
+
+              Expand-Archive -Path $archive -DestinationPath $downloads -Force
+
+              Write-Host "Downloads anteriores restaurados!"
+            }
+            else {
+              Write-Host "Nenhum backup anterior encontrado. Primeira sessão."
+            }
+          }
+          catch {
+            Write-Warning "Não foi possível restaurar o backup: $_"
+          }
+
       - name: Instalar AnyDesk e mostrar ID e senha
         timeout-minutes: 15
+        shell: pwsh
         run: |
           $chars = "abcdefghjkmnpqrstuvwxyz23456789".ToCharArray()
           $pw = "Ab3-" + (-join ($chars | Get-Random -Count 10))
 
           $ad = "C:\AnyDesk\AnyDesk.exe"
+
           Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile "$env:TEMP\AnyDesk.exe"
+
           Start-Process "$env:TEMP\AnyDesk.exe" -ArgumentList "--install C:\AnyDesk --start-with-win --silent"
 
-          for ($i = 0; $i -lt 40 -and -not (Test-Path $ad); $i++) { Start-Sleep -Seconds 3 }
+          for ($i = 0; $i -lt 40 -and -not (Test-Path $ad); $i++) {
+              Start-Sleep -Seconds 3
+          }
+
           if (-not (Test-Path $ad)) {
               Write-Error "AnyDesk nao foi instalado"
               exit 1
           }
+
           Start-Sleep -Seconds 15
 
           cmd /c "echo $pw | ""$ad"" --set-password"
           Start-Sleep -Seconds 5
 
           $id = ""
+
           for ($i = 0; $i -lt 12 -and -not $id; $i++) {
               $id = (& $ad --get-id | Out-String).Trim()
               if (-not $id) { Start-Sleep -Seconds 5 }
           }
+
           if (-not $id) {
               Write-Error "Nao consegui obter o ID do AnyDesk"
               exit 1
@@ -49,6 +112,37 @@ jobs:
           Write-Host "=============================="
 
       - name: Manter ativo
+        shell: pwsh
         run: |
           $end = (Get-Date).AddMinutes(350)
-          while ((Get-Date) -lt $end) { Start-Sleep -Seconds 60 }
+
+          while ((Get-Date) -lt $end) {
+              Start-Sleep -Seconds 60
+          }
+
+      - name: Preparar backup dos downloads
+        if: always()
+        shell: pwsh
+        run: |
+          $source = "$env:USERPROFILE\Downloads"
+          $backup = "$env:RUNNER_TEMP\pc-backup\Downloads"
+
+          New-Item -ItemType Directory -Force -Path $backup | Out-Null
+
+          if (Test-Path $source) {
+              Copy-Item "$source\*" $backup -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          if (-not (Get-ChildItem $backup -Force)) {
+              New-Item -ItemType File -Path "$backup\.keep" | Out-Null
+          }
+
+      - name: Salvar downloads no GitHub
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pc-virtual-downloads
+          path: ${{ runner.temp }}/pc-backup/Downloads/
+          retention-days: 90
+          if-no-files-found: warn
+          
