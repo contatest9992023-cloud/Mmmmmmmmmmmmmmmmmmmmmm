@@ -14,6 +14,11 @@ jobs:
     timeout-minutes: 360
 
     steps:
+
+      # ==========================================
+      # 1. RESTAURAR DOWNLOADS DA SESSÃO ANTERIOR
+      # ==========================================
+
       - name: Restaurar downloads anteriores
         shell: pwsh
         env:
@@ -59,83 +64,238 @@ jobs:
               Write-Host "Downloads anteriores restaurados!"
             }
             else {
-              Write-Host "Nenhum backup anterior encontrado. Primeira sessão."
+              Write-Host "Nenhum backup anterior encontrado."
             }
           }
           catch {
-            Write-Warning "Não foi possível restaurar o backup: $_"
+            Write-Warning "Erro ao restaurar backup: $_"
           }
+
+      # ==========================================
+      # 2. INSTALAR CLAUDE DESKTOP
+      # ==========================================
+
+      - name: Instalar Claude Desktop
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            throw "Winget não está disponível neste Windows."
+          }
+
+          winget install `
+            --id Anthropic.Claude `
+            --exact `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha na instalação do Claude Desktop."
+          }
+
+          Write-Host "Claude Desktop instalado!"
+
+      # ==========================================
+      # 3. INSTALAR ROBLOX STUDIO
+      # ==========================================
+
+      - name: Instalar Roblox Studio
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ProgressPreference = "SilentlyContinue"
+
+          $installer = "$env:TEMP\RobloxStudioInstaller.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" `
+            -OutFile $installer
+
+          $signature = Get-AuthenticodeSignature $installer
+
+          if ($signature.Status -ne "Valid") {
+            throw "Assinatura do instalador Roblox inválida."
+          }
+
+          Write-Host "Iniciando instalação do Roblox Studio..."
+
+          $process = Start-Process `
+            -FilePath $installer `
+            -PassThru
+
+          $mcp = "$env:LOCALAPPDATA\Roblox\mcp.bat"
+
+          $installed = $false
+
+          for ($i = 0; $i -lt 120; $i++) {
+            if (Test-Path $mcp) {
+              $installed = $true
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $installed) {
+            throw "Roblox Studio MCP não encontrado. Verifique a instalação."
+          }
+
+          Write-Host "Roblox Studio instalado!"
+          Write-Host "MCP encontrado em: $mcp"
+
+      # ==========================================
+      # 4. CONFIGURAR MCP NO CLAUDE
+      # ==========================================
+
+      - name: Configurar Roblox MCP no Claude
+        shell: pwsh
+        run: |
+          $configDir = "$env:APPDATA\Claude"
+
+          $configFile = Join-Path `
+            $configDir `
+            "claude_desktop_config.json"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $configDir | Out-Null
+
+          $mcp = "$env:LOCALAPPDATA\Roblox\mcp.bat"
+
+          if (-not (Test-Path $mcp)) {
+            throw "Arquivo mcp.bat não encontrado."
+          }
+
+          $config = @{
+            mcpServers = @{
+              Roblox_Studio = @{
+                command = "cmd.exe"
+                args = @(
+                  "/c",
+                  "%LOCALAPPDATA%\Roblox\mcp.bat"
+                )
+              }
+            }
+          }
+
+          $json = $config | ConvertTo-Json -Depth 10
+
+          Set-Content `
+            -Path $configFile `
+            -Value $json `
+            -Encoding UTF8
+
+          Write-Host "Configuração MCP criada!"
+          Write-Host $configFile
+
+      # ==========================================
+      # 5. INSTALAR ANYDESK E GERAR SENHA
+      # ==========================================
 
       - name: Instalar AnyDesk e mostrar ID e senha
         timeout-minutes: 15
         shell: pwsh
         run: |
           $chars = "abcdefghjkmnpqrstuvwxyz23456789".ToCharArray()
+
           $pw = "Ab3-" + (-join ($chars | Get-Random -Count 10))
 
           $ad = "C:\AnyDesk\AnyDesk.exe"
 
-          Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile "$env:TEMP\AnyDesk.exe"
+          Invoke-WebRequest `
+            -Uri "https://download.anydesk.com/AnyDesk.exe" `
+            -OutFile "$env:TEMP\AnyDesk.exe"
 
-          Start-Process "$env:TEMP\AnyDesk.exe" -ArgumentList "--install C:\AnyDesk --start-with-win --silent"
+          Start-Process `
+            "$env:TEMP\AnyDesk.exe" `
+            -ArgumentList "--install C:\AnyDesk --start-with-win --silent"
 
           for ($i = 0; $i -lt 40 -and -not (Test-Path $ad); $i++) {
-              Start-Sleep -Seconds 3
+            Start-Sleep -Seconds 3
           }
 
           if (-not (Test-Path $ad)) {
-              Write-Error "AnyDesk nao foi instalado"
-              exit 1
+            throw "AnyDesk não foi instalado."
           }
 
           Start-Sleep -Seconds 15
 
           cmd /c "echo $pw | ""$ad"" --set-password"
+
           Start-Sleep -Seconds 5
 
           $id = ""
 
           for ($i = 0; $i -lt 12 -and -not $id; $i++) {
-              $id = (& $ad --get-id | Out-String).Trim()
-              if (-not $id) { Start-Sleep -Seconds 5 }
+            $id = (& $ad --get-id | Out-String).Trim()
+
+            if (-not $id) {
+              Start-Sleep -Seconds 5
+            }
           }
 
           if (-not $id) {
-              Write-Error "Nao consegui obter o ID do AnyDesk"
-              exit 1
+            throw "Não consegui obter o ID do AnyDesk."
           }
 
           Write-Host ""
-          Write-Host "=============================="
+          Write-Host "================================"
           Write-Host "ID:    $id"
           Write-Host "SENHA: $pw"
-          Write-Host "=============================="
+          Write-Host "================================"
+
+      # ==========================================
+      # 6. MANTER PC ATIVO
+      # ==========================================
 
       - name: Manter ativo
         shell: pwsh
         run: |
+          Write-Host "PC virtual iniciado!"
+
           $end = (Get-Date).AddMinutes(350)
 
           while ((Get-Date) -lt $end) {
-              Start-Sleep -Seconds 60
+            Start-Sleep -Seconds 60
           }
+
+      # ==========================================
+      # 7. PREPARAR BACKUP
+      # ==========================================
 
       - name: Preparar backup dos downloads
         if: always()
         shell: pwsh
         run: |
           $source = "$env:USERPROFILE\Downloads"
+
           $backup = "$env:RUNNER_TEMP\pc-backup\Downloads"
 
-          New-Item -ItemType Directory -Force -Path $backup | Out-Null
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $backup | Out-Null
 
           if (Test-Path $source) {
-              Copy-Item "$source\*" $backup -Recurse -Force -ErrorAction SilentlyContinue
+            Copy-Item `
+              "$source\*" `
+              $backup `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
           }
 
           if (-not (Get-ChildItem $backup -Force)) {
-              New-Item -ItemType File -Path "$backup\.keep" | Out-Null
+            New-Item `
+              -ItemType File `
+              -Path "$backup\.keep" | Out-Null
           }
+
+      # ==========================================
+      # 8. SALVAR BACKUP NO GITHUB
+      # ==========================================
 
       - name: Salvar downloads no GitHub
         if: always()
