@@ -16,7 +16,7 @@ jobs:
     steps:
 
       # ==========================================
-      # 1. RESTAURAR DOWNLOADS DA SESSÃO ANTERIOR
+      # 1. RESTAURAR DOWNLOADS ANTERIORES
       # ==========================================
 
       - name: Restaurar downloads anteriores
@@ -61,19 +61,18 @@ jobs:
 
               Expand-Archive -Path $archive -DestinationPath $downloads -Force
 
-              Write-Host "Downloads anteriores restaurados!"
+              Write-Host "Downloads restaurados!"
             }
             else {
               Write-Host "Nenhum backup anterior encontrado."
             }
           }
           catch {
-            Write-Warning "Erro ao restaurar backup: $_"
+            Write-Warning "Falha ao restaurar: $_"
           }
 
-
       # ==========================================
-      # 2. INSTALAR CLAUDE PELO DOWNLOAD RESTAURADO
+      # 2. LOCALIZAR E INSTALAR CLAUDE
       # ==========================================
 
       - name: Instalar Claude Desktop
@@ -82,37 +81,57 @@ jobs:
         run: |
           $downloads = "$env:USERPROFILE\Downloads"
 
-          $claude = Get-ChildItem $downloads -File -Recurse |
+          $msix = Get-ChildItem $downloads -File -Recurse |
             Where-Object {
-              $_.Name -match '^Claude.*\.(exe|msi)$'
+              $_.Name -match '^Claude.*\.(msix|msixbundle)$'
             } |
             Select-Object -First 1
 
-          if (-not $claude) {
-            throw "Instalador do Claude não encontrado em Downloads."
+          $exe = Get-ChildItem $downloads -File -Recurse |
+            Where-Object {
+              $_.Name -match '^Claude.*\.exe$'
+            } |
+            Select-Object -First 1
+
+          if ($msix) {
+            Write-Host "Pacote MSIX encontrado: $($msix.Name)"
+
+            Add-AppxPackage -Path $msix.FullName -ErrorAction Stop
+
           }
+          elseif ($exe) {
+            Write-Host "Instalador encontrado: $($exe.FullName)"
 
-          Write-Host "Instalador encontrado: $($claude.FullName)"
+            $signature = Get-AuthenticodeSignature $exe.FullName
 
-          if ($claude.Extension -eq ".msi") {
-            $p = Start-Process msiexec.exe `
-              -ArgumentList "/i `"$($claude.FullName)`" /qn" `
-              -Wait -PassThru
+            if ($signature.Status -ne "Valid") {
+              throw "Assinatura do Claude inválida."
+            }
+
+            Write-Host "Executando instalador sem parâmetros não documentados..."
+
+            $process = Start-Process `
+              -FilePath $exe.FullName `
+              -Wait `
+              -PassThru
+
+            Write-Host "Código de saída: $($process.ExitCode)"
+
+            $package = Get-AppxPackage |
+              Where-Object { $_.Name -match "Claude" }
+
+            if (-not $package) {
+              throw "Claude não foi registrado. O instalador EXE pode exigir interação ou privilégios."
+            }
           }
           else {
-            $p = Start-Process $claude.FullName `
-              -ArgumentList "-s" `
-              -Wait -PassThru
-          }
-
-          if ($p.ExitCode -notin @(0, 3010)) {
-            throw "Falha ao instalar Claude. Código: $($p.ExitCode)"
+            throw "Nenhum instalador Claude encontrado em Downloads."
           }
 
           Write-Host "Claude instalado!"
 
       # ==========================================
-      # 3. INSTALAR ROBLOX STUDIO PELO DOWNLOAD
+      # 3. LOCALIZAR E INSTALAR ROBLOX STUDIO
       # ==========================================
 
       - name: Instalar Roblox Studio
@@ -128,35 +147,43 @@ jobs:
             Select-Object -First 1
 
           if (-not $studio) {
-            throw "Instalador do Roblox Studio não encontrado."
+            throw "Instalador Roblox Studio não encontrado."
           }
 
-          Write-Host "Instalador encontrado: $($studio.FullName)"
+          Write-Host "Instalador: $($studio.FullName)"
 
           $signature = Get-AuthenticodeSignature $studio.FullName
 
           if ($signature.Status -ne "Valid") {
-            throw "Assinatura do instalador inválida."
+            throw "Assinatura do instalador Roblox inválida."
           }
 
-          $p = Start-Process $studio.FullName `
-            -ArgumentList "-install" `
-            -Wait -PassThru
+          $process = Start-Process `
+            -FilePath $studio.FullName `
+            -PassThru
 
           $mcp = "$env:LOCALAPPDATA\Roblox\mcp.bat"
 
-          for ($i = 0; $i -lt 120 -and -not (Test-Path $mcp); $i++) {
+          $installed = $false
+
+          for ($i = 0; $i -lt 120; $i++) {
+            if (Test-Path $mcp) {
+              $installed = $true
+              break
+            }
+
             Start-Sleep -Seconds 5
           }
 
-          if (-not (Test-Path $mcp)) {
-            throw "Instalação concluída sem localizar o MCP."
+          if (-not $installed) {
+            throw "MCP do Roblox Studio não apareceu. Verifique se o instalador concluiu."
           }
 
-          Write-Host "Roblox Studio e MCP encontrados!"
+          Write-Host "Roblox Studio instalado!"
+          Write-Host "MCP localizado: $mcp"
 
       # ==========================================
-      # 4. CONFIGURAR MCP NO CLAUDE
+      # 4. CONFIGURAR MCP DO ROBLOX NO CLAUDE
       # ==========================================
 
       - name: Configurar Roblox MCP no Claude
@@ -165,13 +192,16 @@ jobs:
           $configDir = "$env:APPDATA\Claude"
           $configFile = Join-Path $configDir "claude_desktop_config.json"
 
-          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-
           $mcp = "$env:LOCALAPPDATA\Roblox\mcp.bat"
 
           if (-not (Test-Path $mcp)) {
             throw "mcp.bat não encontrado."
           }
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $configDir | Out-Null
 
           $config = @{
             mcpServers = @{
@@ -179,7 +209,7 @@ jobs:
                 command = "cmd.exe"
                 args = @(
                   "/c",
-                  "cd /d %LOCALAPPDATA%\Roblox && mcp.bat"
+                  "%LOCALAPPDATA%\Roblox\mcp.bat"
                 )
               }
             }
@@ -188,19 +218,18 @@ jobs:
           $config | ConvertTo-Json -Depth 10 |
             Set-Content -Path $configFile -Encoding UTF8
 
-          Write-Host "MCP configurado no Claude!"
-          
+          Write-Host "Configuração MCP criada!"
+          Write-Host $configFile
 
       # ==========================================
-      # 5. INSTALAR ANYDESK E GERAR SENHA
+      # 5. INSTALAR ANYDESK
       # ==========================================
 
       - name: Instalar AnyDesk e mostrar ID e senha
-        timeout-minutes: 15
         shell: pwsh
+        timeout-minutes: 15
         run: |
           $chars = "abcdefghjkmnpqrstuvwxyz23456789".ToCharArray()
-
           $pw = "Ab3-" + (-join ($chars | Get-Random -Count 10))
 
           $ad = "C:\AnyDesk\AnyDesk.exe"
@@ -238,7 +267,7 @@ jobs:
           }
 
           if (-not $id) {
-            throw "Não consegui obter o ID do AnyDesk."
+            throw "Não consegui obter ID do AnyDesk."
           }
 
           Write-Host ""
@@ -248,7 +277,7 @@ jobs:
           Write-Host "================================"
 
       # ==========================================
-      # 6. MANTER PC ATIVO
+      # 6. MANTER ATIVO
       # ==========================================
 
       - name: Manter ativo
@@ -271,13 +300,9 @@ jobs:
         shell: pwsh
         run: |
           $source = "$env:USERPROFILE\Downloads"
-
           $backup = "$env:RUNNER_TEMP\pc-backup\Downloads"
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $backup | Out-Null
+          New-Item -ItemType Directory -Force -Path $backup | Out-Null
 
           if (Test-Path $source) {
             Copy-Item `
@@ -289,13 +314,11 @@ jobs:
           }
 
           if (-not (Get-ChildItem $backup -Force)) {
-            New-Item `
-              -ItemType File `
-              -Path "$backup\.keep" | Out-Null
+            New-Item -ItemType File -Path "$backup\.keep" | Out-Null
           }
 
       # ==========================================
-      # 8. SALVAR BACKUP NO GITHUB
+      # 8. SALVAR DOWNLOADS NO GITHUB
       # ==========================================
 
       - name: Salvar downloads no GitHub
