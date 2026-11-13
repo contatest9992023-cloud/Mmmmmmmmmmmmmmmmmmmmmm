@@ -71,78 +71,89 @@ jobs:
             Write-Warning "Erro ao restaurar backup: $_"
           }
 
+
       # ==========================================
-      # 2. INSTALAR CLAUDE DESKTOP
+      # 2. INSTALAR CLAUDE PELO DOWNLOAD RESTAURADO
       # ==========================================
 
       - name: Instalar Claude Desktop
-        timeout-minutes: 15
         shell: pwsh
+        timeout-minutes: 15
         run: |
-          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-            throw "Winget não está disponível neste Windows."
+          $downloads = "$env:USERPROFILE\Downloads"
+
+          $claude = Get-ChildItem $downloads -File -Recurse |
+            Where-Object {
+              $_.Name -match '^Claude.*\.(exe|msi)$'
+            } |
+            Select-Object -First 1
+
+          if (-not $claude) {
+            throw "Instalador do Claude não encontrado em Downloads."
           }
 
-          winget install `
-            --id Anthropic.Claude `
-            --exact `
-            --silent `
-            --accept-package-agreements `
-            --accept-source-agreements
+          Write-Host "Instalador encontrado: $($claude.FullName)"
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Falha na instalação do Claude Desktop."
+          if ($claude.Extension -eq ".msi") {
+            $p = Start-Process msiexec.exe `
+              -ArgumentList "/i `"$($claude.FullName)`" /qn" `
+              -Wait -PassThru
+          }
+          else {
+            $p = Start-Process $claude.FullName `
+              -ArgumentList "-s" `
+              -Wait -PassThru
           }
 
-          Write-Host "Claude Desktop instalado!"
+          if ($p.ExitCode -notin @(0, 3010)) {
+            throw "Falha ao instalar Claude. Código: $($p.ExitCode)"
+          }
+
+          Write-Host "Claude instalado!"
 
       # ==========================================
-      # 3. INSTALAR ROBLOX STUDIO
+      # 3. INSTALAR ROBLOX STUDIO PELO DOWNLOAD
       # ==========================================
 
       - name: Instalar Roblox Studio
-        timeout-minutes: 15
         shell: pwsh
+        timeout-minutes: 15
         run: |
-          $ProgressPreference = "SilentlyContinue"
+          $downloads = "$env:USERPROFILE\Downloads"
 
-          $installer = "$env:TEMP\RobloxStudioInstaller.exe"
+          $studio = Get-ChildItem $downloads -File -Recurse |
+            Where-Object {
+              $_.Name -match '^RobloxStudio.*\.exe$'
+            } |
+            Select-Object -First 1
 
-          Invoke-WebRequest `
-            -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" `
-            -OutFile $installer
-
-          $signature = Get-AuthenticodeSignature $installer
-
-          if ($signature.Status -ne "Valid") {
-            throw "Assinatura do instalador Roblox inválida."
+          if (-not $studio) {
+            throw "Instalador do Roblox Studio não encontrado."
           }
 
-          Write-Host "Iniciando instalação do Roblox Studio..."
+          Write-Host "Instalador encontrado: $($studio.FullName)"
 
-          $process = Start-Process `
-            -FilePath $installer `
-            -PassThru
+          $signature = Get-AuthenticodeSignature $studio.FullName
+
+          if ($signature.Status -ne "Valid") {
+            throw "Assinatura do instalador inválida."
+          }
+
+          $p = Start-Process $studio.FullName `
+            -ArgumentList "-install" `
+            -Wait -PassThru
 
           $mcp = "$env:LOCALAPPDATA\Roblox\mcp.bat"
 
-          $installed = $false
-
-          for ($i = 0; $i -lt 120; $i++) {
-            if (Test-Path $mcp) {
-              $installed = $true
-              break
-            }
-
+          for ($i = 0; $i -lt 120 -and -not (Test-Path $mcp); $i++) {
             Start-Sleep -Seconds 5
           }
 
-          if (-not $installed) {
-            throw "Roblox Studio MCP não encontrado. Verifique a instalação."
+          if (-not (Test-Path $mcp)) {
+            throw "Instalação concluída sem localizar o MCP."
           }
 
-          Write-Host "Roblox Studio instalado!"
-          Write-Host "MCP encontrado em: $mcp"
+          Write-Host "Roblox Studio e MCP encontrados!"
 
       # ==========================================
       # 4. CONFIGURAR MCP NO CLAUDE
@@ -152,20 +163,14 @@ jobs:
         shell: pwsh
         run: |
           $configDir = "$env:APPDATA\Claude"
+          $configFile = Join-Path $configDir "claude_desktop_config.json"
 
-          $configFile = Join-Path `
-            $configDir `
-            "claude_desktop_config.json"
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $configDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
           $mcp = "$env:LOCALAPPDATA\Roblox\mcp.bat"
 
           if (-not (Test-Path $mcp)) {
-            throw "Arquivo mcp.bat não encontrado."
+            throw "mcp.bat não encontrado."
           }
 
           $config = @{
@@ -174,21 +179,17 @@ jobs:
                 command = "cmd.exe"
                 args = @(
                   "/c",
-                  "%LOCALAPPDATA%\Roblox\mcp.bat"
+                  "cd /d %LOCALAPPDATA%\Roblox && mcp.bat"
                 )
               }
             }
           }
 
-          $json = $config | ConvertTo-Json -Depth 10
+          $config | ConvertTo-Json -Depth 10 |
+            Set-Content -Path $configFile -Encoding UTF8
 
-          Set-Content `
-            -Path $configFile `
-            -Value $json `
-            -Encoding UTF8
-
-          Write-Host "Configuração MCP criada!"
-          Write-Host $configFile
+          Write-Host "MCP configurado no Claude!"
+          
 
       # ==========================================
       # 5. INSTALAR ANYDESK E GERAR SENHA
