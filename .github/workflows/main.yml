@@ -1,5 +1,5 @@
 
-name: RDP Ultimate v15
+name: RDP Ultimate v16
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   rdp:
-    name: RDP Ultimate v15
+    name: RDP Ultimate v16
     runs-on: windows-latest
     timeout-minutes: 360
 
@@ -36,7 +36,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force $env:WORK_DIR | Out-Null
 
-          "RDP Ultimate v15" | Set-Content $env:LOG_FILE
+          "RDP Ultimate v16" | Set-Content $env:LOG_FILE
           "Início: $(Get-Date)" | Add-Content $env:LOG_FILE
           "Runner: $env:RUNNER_NAME" | Add-Content $env:LOG_FILE
           "Windows: $([Environment]::OSVersion.VersionString)" |
@@ -68,168 +68,243 @@ jobs:
               Sort-Object created_at -Descending |
               Select-Object -First 1
 
-            if (-not $artifact) {
-              "Nenhum backup anterior encontrado." |
-                Add-Content $env:LOG_FILE
-              return
-            }
+            if ($artifact) {
+              $zip = "$env:WORK_DIR\previous.zip"
+              $restore = "$env:WORK_DIR\Restored"
 
-            $zip = "$env:WORK_DIR\previous.zip"
-            $restore = "$env:WORK_DIR\Restored"
+              Invoke-WebRequest `
+                -Uri $artifact.archive_download_url `
+                -Headers $headers `
+                -OutFile $zip
 
-            Invoke-WebRequest `
-              -Uri $artifact.archive_download_url `
-              -Headers $headers `
-              -OutFile $zip
+              Expand-Archive $zip $restore -Force
 
-            Expand-Archive $zip $restore -Force
+              function Restore-Folder {
+                param($Source, $Destination)
 
-            function Restore-Folder {
-              param($Source, $Destination)
+                if (Test-Path $Source) {
+                  New-Item -ItemType Directory -Force $Destination |
+                    Out-Null
 
-              if (Test-Path $Source) {
-                New-Item -ItemType Directory -Force $Destination |
+                  Get-ChildItem $Source -Force |
+                    Copy-Item -Destination $Destination -Recurse -Force
+                }
+              }
+
+              Restore-Folder "$restore\Downloads" `
+                "$env:USERPROFILE\Downloads"
+
+              Restore-Folder "$restore\RobloxProjects" `
+                "$env:USERPROFILE\Documents\RobloxProjects"
+
+              Restore-Folder "$restore\Roblox" `
+                "$env:USERPROFILE\Documents\Roblox"
+
+              $config = "$restore\ClaudeConfig\claude_desktop_config.json"
+
+              if (Test-Path $config) {
+                New-Item -ItemType Directory -Force "$env:APPDATA\Claude" |
                   Out-Null
 
-                Get-ChildItem $Source -Force |
-                  Copy-Item -Destination $Destination -Recurse -Force
+                Copy-Item $config `
+                  "$env:APPDATA\Claude\claude_desktop_config.json" -Force
               }
+
+              "Backup restaurado: $($artifact.created_at)" |
+                Add-Content $env:LOG_FILE
             }
-
-            Restore-Folder "$restore\Downloads" "$env:USERPROFILE\Downloads"
-
-            Restore-Folder "$restore\RobloxProjects" `
-              "$env:USERPROFILE\Documents\RobloxProjects"
-
-            Restore-Folder "$restore\Roblox" `
-              "$env:USERPROFILE\Documents\Roblox"
-
-            $config = "$restore\ClaudeConfig\claude_desktop_config.json"
-
-            if (Test-Path $config) {
-              $destination = "$env:APPDATA\Claude"
-              New-Item -ItemType Directory -Force $destination |
-                Out-Null
-
-              Copy-Item $config `
-                "$destination\claude_desktop_config.json" -Force
+            else {
+              "Nenhum backup anterior encontrado." |
+                Add-Content $env:LOG_FILE
             }
-
-            "Backup restaurado: $($artifact.created_at)" |
-              Add-Content $env:LOG_FILE
           }
           catch {
-            "AVISO RESTAURAÇÃO: $($_.Exception.Message)" |
+            "AVISO BACKUP: $($_.Exception.Message)" |
               Add-Content $env:LOG_FILE
           }
 
       # ==========================================
-      # 3. ANYDESK - INSTALAÇÃO, ID E SENHA
+      # 3. ANYDESK - INSTALAÇÃO E INICIALIZAÇÃO
       # ==========================================
 
-      - name: Instalar e configurar AnyDesk
+      - name: Instalar e iniciar AnyDesk
+        id: anydesk
         shell: pwsh
         env:
           ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $paths = @(
-            "C:\Program Files (x86)\AnyDesk\AnyDesk.exe",
-            "C:\Program Files\AnyDesk\AnyDesk.exe"
-          )
+          $id = ""
+          $exe = $null
+          $status = "FAILED"
 
-          $exe = $paths |
-            Where-Object { Test-Path $_ } |
-            Select-Object -First 1
+          try {
+            $installDir = "C:\Program Files (x86)\AnyDesk"
+            $downloadedExe = "$env:WORK_DIR\AnyDesk.exe"
 
-          if (-not $exe) {
-            $installer = "$env:TEMP\AnyDesk-Installer.exe"
+            $locations = @(
+              "$installDir\AnyDesk.exe",
+              "C:\Program Files\AnyDesk\AnyDesk.exe"
+            )
 
-            Invoke-WebRequest `
-              "https://download.anydesk.com/AnyDesk.exe" `
-              -OutFile $installer
-
-            Start-Process $installer -ArgumentList @(
-              "--install",
-              "C:\Program Files (x86)\AnyDesk",
-              "--start-with-win",
-              "--silent",
-              "--create-shortcuts"
-            ) -Wait
-
-            Start-Sleep -Seconds 8
-
-            $exe = $paths |
+            # 1. Procurar instalação existente
+            $exe = $locations |
               Where-Object { Test-Path $_ } |
               Select-Object -First 1
-          }
 
-          if (-not $exe) {
-            throw "AnyDesk não foi instalado."
-          }
+            # 2. Baixar se não existir
+            if (-not $exe) {
+              Write-Host "Baixando AnyDesk..."
 
-          & $exe --start
-          Start-Sleep -Seconds 8
+              Invoke-WebRequest `
+                -Uri "https://download.anydesk.com/AnyDesk.exe" `
+                -OutFile $downloadedExe
 
-          if ([string]::IsNullOrWhiteSpace($env:ANYDESK_PASSWORD)) {
-            throw "Secret ANYDESK_PASSWORD não configurado."
-          }
+              if (-not (Test-Path $downloadedExe)) {
+                throw "Download do AnyDesk não foi criado."
+              }
 
-          $env:ANYDESK_PASSWORD |
-            & $exe --set-password _unattended_access
+              $file = Get-Item $downloadedExe
 
-          Start-Sleep -Seconds 3
+              if ($file.Length -lt 1000000) {
+                throw "Arquivo AnyDesk muito pequeno ou inválido."
+              }
 
-          # O AnyDesk não imprime o ID diretamente
-          # no console em todas as versões.
-          # Capturamos pelo método oficial com FOR /F.
+              # 3. Tentar instalação oficial
+              Write-Host "Tentando instalar AnyDesk..."
 
-          $batch = "$env:TEMP\get-anydesk-id.cmd"
+              try {
+                & $downloadedExe --install $installDir `
+                  --start-with-win `
+                  --silent `
+                  --create-shortcuts
 
-          @"
-          @echo off
-          for /f "delims=" %%i in ('"$exe" --get-id') do set "ID=%%i"
-          echo %ID%
-          "@ | Set-Content $batch -Encoding ASCII
+                Start-Sleep -Seconds 12
+              }
+              catch {
+                "Instalação retornou aviso: $($_.Exception.Message)" |
+                  Add-Content $env:LOG_FILE
+              }
 
-          $id = ""
+              # 4. Procurar executável instalado
+              $exe = $locations |
+                Where-Object { Test-Path $_ } |
+                Select-Object -First 1
 
-          for ($i = 0; $i -lt 12; $i++) {
-            $output = & cmd.exe /d /c "`"$batch`"" 2>$null
-            $id = ($output | Out-String).Trim()
-
-            if ($id -match '^[0-9]{6,}$') {
-              break
+              # 5. Alternativa: executar versão portátil
+              if (-not $exe) {
+                Write-Host "Instalação não localizada. Usando versão baixada."
+                $exe = $downloadedExe
+              }
             }
 
+            if (-not (Test-Path $exe)) {
+              throw "Executável AnyDesk não encontrado."
+            }
+
+            "AnyDesk executável: $exe" |
+              Add-Content $env:LOG_FILE
+
+            # 6. Iniciar aplicativo
+            try {
+              & $exe --start 2>&1 |
+                ForEach-Object { "$_" | Add-Content $env:LOG_FILE }
+            }
+            catch {
+              "Aviso ao iniciar serviço: $($_.Exception.Message)" |
+                Add-Content $env:LOG_FILE
+            }
+
+            Start-Process -FilePath $exe
+            Start-Sleep -Seconds 8
+
+            # 7. Configurar senha no perfil correto
+            if ([string]::IsNullOrWhiteSpace($env:ANYDESK_PASSWORD)) {
+              throw "Secret ANYDESK_PASSWORD está vazio."
+            }
+
+            $env:ANYDESK_PASSWORD |
+              & $exe --set-password _unattended_access
+
+            $passwordExit = $LASTEXITCODE
+
             Start-Sleep -Seconds 5
+
+            if ($passwordExit -ne 0) {
+              throw "AnyDesk não confirmou a configuração da senha. Código: $passwordExit"
+            }
+
+            # 8. Criar script para obter o ID
+            $batch = "$env:WORK_DIR\get-anydesk-id.cmd"
+
+            @"
+          @echo off
+          for /f "delims=" %%i in ('"$exe" --get-id') do echo %%i
+          "@ | Set-Content $batch -Encoding ASCII
+
+            # 9. Capturar ID
+            for ($i = 1; $i -le 12; $i++) {
+              $result = & cmd.exe /d /c "`"$batch`"" 2>$null
+
+              $candidate = $result |
+                Where-Object {
+                  "$_".Trim() -match '^[0-9]{6,}$'
+                } |
+                Select-Object -First 1
+
+              if ($candidate) {
+                $id = "$candidate".Trim()
+                break
+              }
+
+              Start-Sleep -Seconds 5
+            }
+
+            if ($id -notmatch '^[0-9]{6,}$') {
+              throw "Não foi possível capturar um ID válido."
+            }
+
+            $status = "SUCCESS"
+
+            "AnyDesk ID: $id" | Add-Content $env:LOG_FILE
+            "Senha de acesso configurada." |
+              Add-Content $env:LOG_FILE
+
+            "ANYDESK_ID=$id" >> $env:GITHUB_ENV
+
+            "## ACESSO ANYDESK" >> $env:GITHUB_STEP_SUMMARY
+            "" >> $env:GITHUB_STEP_SUMMARY
+            "**ID:** $id" >> $env:GITHUB_STEP_SUMMARY
+            "**Senha:** valor de ANYDESK_PASSWORD" >>
+              $env:GITHUB_STEP_SUMMARY
+
+            Write-Host ""
+            Write-Host "=================================="
+            Write-Host "ANYDESK ID: $id"
+            Write-Host "SENHA: configurada"
+            Write-Host "=================================="
+          }
+          catch {
+            $status = "FAILED"
+
+            "ERRO ANYDESK: $($_.Exception.Message)" |
+              Tee-Object -FilePath $env:LOG_FILE -Append
+
+            "## ANYDESK: FALHA" >> $env:GITHUB_STEP_SUMMARY
+            "" >> $env:GITHUB_STEP_SUMMARY
+            "$($_.Exception.Message)" >> $env:GITHUB_STEP_SUMMARY
+
+            Write-Host "Falha no AnyDesk: $($_.Exception.Message)"
           }
 
-          if ($id -notmatch '^[0-9]{6,}$') {
-            throw "AnyDesk não forneceu um ID válido."
-          }
-
-          "ANYDESK_ID=$id" >> $env:GITHUB_ENV
-
-          "AnyDesk ID: $id" | Add-Content $env:LOG_FILE
-          "Senha de acesso não supervisionado configurada." |
-            Add-Content $env:LOG_FILE
-
-          "## ACESSO ANYDESK" >> $env:GITHUB_STEP_SUMMARY
-          "" >> $env:GITHUB_STEP_SUMMARY
-          "**ID:** $id" >> $env:GITHUB_STEP_SUMMARY
-          "**Senha:** use o valor cadastrado em ANYDESK_PASSWORD." `
-            >> $env:GITHUB_STEP_SUMMARY
-
-          Write-Host "AnyDesk ID: $id"
-          Write-Host "Senha configurada."
+          "ANYDESK_STATUS=$status" >> $env:GITHUB_ENV
 
       # ==========================================
       # 4. ROBLOX STUDIO
       # ==========================================
 
-      - name: Localizar e instalar Roblox Studio
+      - name: Localizar Roblox Studio
         shell: pwsh
         run: |
           try {
@@ -249,35 +324,32 @@ jobs:
                 Select-Object -First 1
 
               if ($installer) {
-                "Instalador Roblox: $($installer.FullName)" |
-                  Add-Content $env:LOG_FILE
-
                 Start-Process $installer.FullName
+
+                $deadline = (Get-Date).AddMinutes(4)
+
+                do {
+                  Start-Sleep -Seconds 8
+
+                  $studio = Get-ChildItem $versions `
+                    -Filter "RobloxStudioBeta.exe" `
+                    -Recurse `
+                    -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+
+                } while (-not $studio -and (Get-Date) -lt $deadline)
               }
-
-              $deadline = (Get-Date).AddMinutes(4)
-
-              do {
-                Start-Sleep -Seconds 8
-
-                $studio = Get-ChildItem $versions `
-                  -Filter "RobloxStudioBeta.exe" `
-                  -Recurse `
-                  -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
-
-              } while (-not $studio -and (Get-Date) -lt $deadline)
             }
 
             if ($studio) {
-              "Roblox Studio: $($studio.FullName)" |
-                Add-Content $env:LOG_FILE
-
               "ROBLOX_STUDIO_EXE=$($studio.FullName)" |
                 Add-Content $env:GITHUB_ENV
+
+              "Roblox Studio localizado: $($studio.FullName)" |
+                Add-Content $env:LOG_FILE
             }
             else {
-              "AVISO: Roblox Studio não localizado." |
+              "Roblox Studio não localizado." |
                 Add-Content $env:LOG_FILE
             }
           }
@@ -291,20 +363,18 @@ jobs:
         run: |
           if ($env:ROBLOX_STUDIO_EXE -and
               (Test-Path $env:ROBLOX_STUDIO_EXE)) {
-
             Start-Process $env:ROBLOX_STUDIO_EXE
             "Roblox Studio iniciado." | Add-Content $env:LOG_FILE
           }
           else {
-            "Roblox Studio não disponível para iniciar." |
-              Add-Content $env:LOG_FILE
+            "Roblox Studio indisponível." | Add-Content $env:LOG_FILE
           }
 
       # ==========================================
       # 5. CLAUDE DESKTOP
       # ==========================================
 
-      - name: Localizar e instalar Claude
+      - name: Localizar Claude
         shell: pwsh
         run: |
           try {
@@ -326,9 +396,6 @@ jobs:
                 Select-Object -First 1
 
               if ($installer) {
-                "Instalador Claude: $($installer.FullName)" |
-                  Add-Content $env:LOG_FILE
-
                 Start-Process $installer.FullName
 
                 $deadline = (Get-Date).AddMinutes(3)
@@ -350,8 +417,7 @@ jobs:
                 Add-Content $env:LOG_FILE
             }
             else {
-              "AVISO: Claude não localizado ou instalação pendente." |
-                Add-Content $env:LOG_FILE
+              "Claude não localizado." | Add-Content $env:LOG_FILE
             }
           }
           catch {
@@ -367,16 +433,14 @@ jobs:
         shell: pwsh
         run: |
           try {
-            $robloxRoot = "$env:LOCALAPPDATA\Roblox"
-
-            $mcp = Get-ChildItem $robloxRoot `
+            $mcp = Get-ChildItem "$env:LOCALAPPDATA\Roblox" `
               -Filter "mcp.bat" `
               -Recurse `
               -ErrorAction SilentlyContinue |
               Select-Object -First 1
 
             if (-not $mcp) {
-              "AVISO: mcp.bat não encontrado. MCP não alterado." |
+              "mcp.bat não encontrado. MCP não alterado." |
                 Add-Content $env:LOG_FILE
               return
             }
@@ -421,9 +485,6 @@ jobs:
 
             "MCP configurado: $($mcp.FullName)" |
               Add-Content $env:LOG_FILE
-
-            "Configuração: $configPath" |
-              Add-Content $env:LOG_FILE
           }
           catch {
             "ERRO MCP: $($_.Exception.Message)" |
@@ -431,7 +492,7 @@ jobs:
           }
 
       # ==========================================
-      # 7. INICIAR CLAUDE DEPOIS DO MCP
+      # 7. INICIAR CLAUDE
       # ==========================================
 
       - name: Iniciar Claude
@@ -439,35 +500,28 @@ jobs:
         run: |
           if ($env:CLAUDE_EXE -and (Test-Path $env:CLAUDE_EXE)) {
             Start-Process $env:CLAUDE_EXE
-            "Claude iniciado após configurar MCP." |
-              Add-Content $env:LOG_FILE
+            "Claude iniciado." | Add-Content $env:LOG_FILE
           }
           else {
-            "Claude não disponível para iniciar." |
-              Add-Content $env:LOG_FILE
+            "Claude não disponível." | Add-Content $env:LOG_FILE
           }
 
       # ==========================================
-      # 8. RESUMO DE CONEXÃO
+      # 8. RESUMO
       # ==========================================
 
-      - name: Resumo de conexão
+      - name: Resumo do ambiente
         shell: pwsh
         run: |
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "          RDP ULTIMATE v15"
-          Write-Host "======================================"
+          Write-Host "========== RDP ULTIMATE v16 =========="
           Write-Host "AnyDesk ID: $env:ANYDESK_ID"
+          Write-Host "AnyDesk Status: $env:ANYDESK_STATUS"
           Write-Host "Claude: $env:CLAUDE_EXE"
-          Write-Host "Roblox Studio: $env:ROBLOX_STUDIO_EXE"
-          Write-Host "======================================"
+          Write-Host "Roblox: $env:ROBLOX_STUDIO_EXE"
 
-          "Resumo de conexão exibido." | Add-Content $env:LOG_FILE
-
-          "## AMBIENTE" >> $env:GITHUB_STEP_SUMMARY
+          "## RESULTADO" >> $env:GITHUB_STEP_SUMMARY
           "" >> $env:GITHUB_STEP_SUMMARY
-          "**AnyDesk ID:** $env:ANYDESK_ID" >>
+          "**AnyDesk:** $env:ANYDESK_STATUS" >>
             $env:GITHUB_STEP_SUMMARY
 
       # ==========================================
@@ -492,7 +546,7 @@ jobs:
               ($end - (Get-Date)).TotalMinutes
             )
 
-            Write-Host "RDP ativo. Restam $remaining minutos."
+            Write-Host "Ambiente ativo. Restam $remaining minutos."
             Start-Sleep -Seconds 60
           }
 
@@ -541,8 +595,8 @@ jobs:
             New-Item -ItemType Directory -Force "$stage\ClaudeConfig" |
               Out-Null
 
-            Copy-Item $config "$stage\ClaudeConfig\claude_desktop_config.json" `
-              -Force
+            Copy-Item $config `
+              "$stage\ClaudeConfig\claude_desktop_config.json" -Force
           }
 
           New-Item -ItemType Directory -Force "$stage\Meta" |
@@ -553,16 +607,15 @@ jobs:
           }
 
           @"
-          RDP Ultimate v15
+          RDP Ultimate v16
           Data: $(Get-Date)
           Repository: $env:GITHUB_REPOSITORY
           Run ID: $env:GITHUB_RUN_ID
           AnyDesk ID: $env:ANYDESK_ID
+          AnyDesk Status: $env:ANYDESK_STATUS
 
-          Este backup não contém credenciais ou sessões privadas.
+          Backup sem credenciais ou sessões privadas.
           "@ | Set-Content "$stage\Meta\report.txt"
-
-          "Backup final preparado." | Add-Content $env:LOG_FILE
 
       # ==========================================
       # 11. ENVIAR BACKUP
@@ -579,7 +632,7 @@ jobs:
           compression-level: 6
 
       # ==========================================
-      # 12. RELATÓRIO
+      # 12. RELATÓRIO FINAL
       # ==========================================
 
       - name: Relatório final
@@ -587,7 +640,7 @@ jobs:
         shell: pwsh
         run: |
           Write-Host ""
-          Write-Host "========== RDP ULTIMATE v15 =========="
+          Write-Host "========== RDP ULTIMATE v16 =========="
 
           if (Test-Path $env:LOG_FILE) {
             Get-Content $env:LOG_FILE
