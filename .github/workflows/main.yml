@@ -1,5 +1,5 @@
 
-name: RDP Ultimate
+name: RDP
 
 on:
   workflow_dispatch:
@@ -9,641 +9,341 @@ permissions:
   actions: read
 
 jobs:
-  rdp:
-    name: RDP Ultimate
+  pc-virtual:
     runs-on: windows-latest
-    timeout-minutes: 350
+    timeout-minutes: 360
 
     steps:
-
-      # ==================================================
-      # 1. PREPARAR AMBIENTE
-      # ==================================================
-
-      - name: Preparar diretórios
+      # ==========================================
+      # 1. RESTAURAR BACKUP
+      # ==========================================
+      - name: Restaurar downloads anteriores
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = "Stop"
+          $downloads = "$env:USERPROFILE\Downloads"
+          $temp = "$env:RUNNER_TEMP\pc-restore"
 
-          $root = "C:\RDP-Ultimate"
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          New-Item -ItemType Directory -Force -Path $temp | Out-Null
 
-          $folders = @(
-            "$root\Restore",
-            "$root\Backup",
-            "$root\Logs",
-            "$env:USERPROFILE\Downloads",
-            "$env:USERPROFILE\Documents\RobloxProjects",
-            "$env:USERPROFILE\Documents\Roblox"
-          )
-
-          foreach ($folder in $folders) {
-            New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
           }
 
-          "RDP Ultimate iniciado: $(Get-Date)" |
-            Out-File "$root\Logs\run.log" -Encoding utf8
+          $repo = $env:GITHUB_REPOSITORY
+          $url = "https://api.github.com/repos/$repo/actions/artifacts?name=pc-virtual-downloads&per_page=100"
 
-      # ==================================================
-      # 2. PROCURAR O BACKUP MAIS RECENTE
-      # ==================================================
+          try {
+            $result = Invoke-RestMethod -Uri $url -Headers $headers
 
-      - name: Procurar backup anterior
-        id: previous
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const runs = await github.rest.actions.listWorkflowRuns({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: "rdp-ultimate.yml",
-              status: "completed",
-              per_page: 100
-            });
+            $artifact = $result.artifacts |
+              Where-Object {
+                $_.name -eq "pc-virtual-downloads" -and
+                -not $_.expired -and
+                $_.workflow_run.id -ne [long]$env:GITHUB_RUN_ID
+              } |
+              Sort-Object created_at -Descending |
+              Select-Object -First 1
 
-            const candidates = runs.data.workflow_runs
-              .filter(run => run.id !== context.runId)
-              .sort((a, b) =>
-                new Date(b.created_at) - new Date(a.created_at)
-              );
+            if ($artifact) {
+              $archive = "$temp\backup.zip"
 
-            for (const run of candidates) {
-              const response = await github.rest.actions.listWorkflowRunArtifacts({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: run.id,
-                per_page: 100
-              });
+              Invoke-WebRequest `
+                -Uri $artifact.archive_download_url `
+                -Headers $headers `
+                -OutFile $archive
 
-              const artifact = response.data.artifacts.find(item =>
-                item.name === "rdp-ultimate-backup" &&
-                !item.expired
-              );
+              Expand-Archive -Path $archive -DestinationPath $downloads -Force
 
-              if (artifact) {
-                core.setOutput("found", "true");
-                core.setOutput("run_id", String(run.id));
-                core.info(`Backup encontrado na execução ${run.id}`);
-                return;
+              Write-Host "Backup restaurado com sucesso!"
+              Get-ChildItem $downloads -Force
+            }
+            else {
+              Write-Host "Nenhum backup encontrado. Primeira execução."
+            }
+          }
+          catch {
+            Write-Warning "Falha ao restaurar backup: $_"
+          }
+
+      # ==========================================
+      # 2. BAIXAR SOMENTE SE NÃO EXISTIR NO BACKUP
+      # ==========================================
+      - name: Preparar instaladores
+        shell: pwsh
+        run: |
+          $downloads = "$env:USERPROFILE\Downloads"
+
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+
+          function Get-Installer {
+            param(
+              [string]$Name,
+              [string]$Url
+            )
+
+            $file = Join-Path $downloads $Name
+
+            if ((Test-Path $file) -and
+                (Get-Item $file).Length -gt 100KB) {
+
+              Write-Host "ARQUIVO ENCONTRADO NO BACKUP: $Name"
+              return $file
+            }
+
+            if (Test-Path $file) {
+              Remove-Item $file -Force
+            }
+
+            Write-Host "Baixando: $Name"
+
+            try {
+              Invoke-WebRequest `
+                -Uri $Url `
+                -OutFile $file `
+                -UseBasicParsing `
+                -TimeoutSec 600
+
+              if (-not (Test-Path $file) -or
+                  (Get-Item $file).Length -lt 100KB) {
+                throw "Download incompleto: $Name"
               }
+
+              Write-Host "Download concluído: $Name"
+              return $file
             }
+            catch {
+              Remove-Item $file -Force -ErrorAction SilentlyContinue
+              throw
+            }
+          }
 
-            core.setOutput("found", "false");
-            core.info("Nenhum backup anterior. O ambiente será iniciado do zero.");
+          # AnyDesk
+          $anydesk = Get-Installer `
+            -Name "AnyDesk.exe" `
+            -Url "https://download.anydesk.com/AnyDesk.exe"
 
-      # ==================================================
-      # 3. BAIXAR BACKUP
-      # NÃO BLOQUEAR A PRIMEIRA EXECUÇÃO
-      # ==================================================
+          # Claude Desktop oficial
+          $claude = Get-Installer `
+            -Name "ClaudeSetup.exe" `
+            -Url "https://claude.ai/api/desktop/win32/x64/setup/latest/redirect"
 
-      - name: Baixar backup anterior
-        if: steps.previous.outputs.found == 'true'
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: rdp-ultimate-backup
-          path: C:\RDP-Ultimate\Restore
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.previous.outputs.run_id }}
+          # Roblox Studio oficial
+          $roblox = Get-Installer `
+            -Name "RobloxStudioInstaller.exe" `
+            -Url "https://setup.rbxcdn.com/RobloxStudioInstaller.exe"
 
-      # ==================================================
-      # 4. RESTAURAR BACKUP
-      # ==================================================
+          Write-Host ""
+          Write-Host "TODOS OS INSTALADORES ESTÃO PREPARADOS"
+          Get-ChildItem $downloads -File |
+            Select-Object Name, Length
 
-      - name: Restaurar arquivos anteriores
-        if: always()
+      # ==========================================
+      # 3. INSTALAR ANYDESK E CONFIGURAR ACESSO
+      # ==========================================
+      - name: Instalar AnyDesk e mostrar ID e senha
+        timeout-minutes: 15
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $downloads = "$env:USERPROFILE\Downloads"
+          $adInstaller = "$downloads\AnyDesk.exe"
 
-          $archive = "C:\RDP-Ultimate\Restore\rdp-ultimate-backup.zip"
-          $restore = "C:\RDP-Ultimate\Restore\Extracted"
+          $chars = "abcdefghjkmnpqrstuvwxyz23456789".ToCharArray()
+          $pw = "Ab3-" + (-join ($chars | Get-Random -Count 10))
 
-          if (!(Test-Path $archive)) {
-            Write-Host "Primeira execução ou backup indisponível."
-            Write-Host "Continuando com ambiente limpo."
-            exit 0
+          $ad = "C:\AnyDesk\AnyDesk.exe"
+
+          if (-not (Test-Path $ad)) {
+            Start-Process `
+              -FilePath $adInstaller `
+              -ArgumentList "--install C:\AnyDesk --start-with-win --silent" `
+              -Wait
           }
 
-          New-Item -ItemType Directory -Force -Path $restore | Out-Null
-
-          Expand-Archive `
-            -LiteralPath $archive `
-            -DestinationPath $restore `
-            -Force
-
-          # Restaurar Downloads
-          $source = "$restore\Downloads"
-          $target = "$env:USERPROFILE\Downloads"
-
-          if (Test-Path $source) {
-            robocopy $source $target /E /R:1 /W:1
-            if ($LASTEXITCODE -ge 8) {
-              throw "Falha restaurando Downloads."
-            }
+          for ($i = 0; $i -lt 40 -and -not (Test-Path $ad); $i++) {
+            Start-Sleep -Seconds 3
           }
 
-          # Restaurar projetos Roblox
-          $source = "$restore\Documents"
-          $target = "$env:USERPROFILE\Documents"
-
-          if (Test-Path $source) {
-            robocopy $source $target /E /R:1 /W:1
-            if ($LASTEXITCODE -ge 8) {
-              throw "Falha restaurando projetos."
-            }
+          if (-not (Test-Path $ad)) {
+            throw "AnyDesk não foi instalado."
           }
 
-          # Restaurar configurações Claude
-          $source = "$restore\AppData\Roaming\Claude"
-          $target = "$env:APPDATA\Claude"
+          Start-Sleep -Seconds 15
 
-          if (Test-Path $source) {
-            New-Item -ItemType Directory -Force -Path $target | Out-Null
-
-            robocopy $source $target /E /R:1 /W:1
-            if ($LASTEXITCODE -ge 8) {
-              throw "Falha restaurando configuração Claude."
-            }
-          }
-
-          Write-Host "Restauração concluída."
-
-      # ==================================================
-      # 5. INSTALAR CLAUDE DESKTOP
-      # ==================================================
-
-      - name: Instalar Claude Desktop
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
-
-          if (!$winget) {
-            throw "Winget não está disponível."
-          }
-
-          $installed = Get-AppxPackage -Name "Claude" -ErrorAction SilentlyContinue
-
-          if (!$installed) {
-            winget install `
-              --id Anthropic.Claude `
-              --exact `
-              --silent `
-              --accept-package-agreements `
-              --accept-source-agreements
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "Falha instalando Claude. Código: $LASTEXITCODE"
-            }
-          }
-          else {
-            Write-Host "Claude já está instalado."
-          }
+          cmd.exe /c "echo $pw| `"$ad`" --set-password"
 
           Start-Sleep -Seconds 5
 
-          $app = Get-StartApps |
-            Where-Object { $_.Name -match "^Claude" } |
-            Select-Object -First 1
+          $id = ""
 
-          if (!$app) {
-            throw "Claude não apareceu no menu de aplicativos."
+          for ($i = 0; $i -lt 12 -and -not $id; $i++) {
+            $id = (& $ad --get-id | Out-String).Trim()
+
+            if (-not $id) {
+              Start-Sleep -Seconds 5
+            }
           }
 
-          "CLAUDE_APP_ID=$($app.AppID)" |
-            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          if (-not $id) {
+            throw "Não foi possível obter o ID do AnyDesk."
+          }
 
-          Write-Host "Claude instalado."
+          Write-Host ""
+          Write-Host "================================"
+          Write-Host "ID:    $id"
+          Write-Host "SENHA: $pw"
+          Write-Host "================================"
 
-      # ==================================================
-      # 6. INSTALAR ROBLOX STUDIO
-      # ==================================================
-
-      - name: Instalar Roblox Studio
+      # ==========================================
+      # 4. INSTALAR CLAUDE DESKTOP
+      # ==========================================
+      - name: Instalar Claude Desktop
+        timeout-minutes: 15
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $installer = "$env:USERPROFILE\Downloads\ClaudeSetup.exe"
 
-          $robloxDir = "$env:LOCALAPPDATA\Roblox"
-          $mcp = "$robloxDir\mcp.bat"
-
-          if (!(Test-Path $mcp)) {
-            $installer = "$env:TEMP\RobloxStudioInstaller.exe"
-
-            Invoke-WebRequest `
-              -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" `
-              -OutFile $installer
-
-            if (!(Test-Path $installer)) {
-              throw "Instalador do Roblox Studio não foi baixado."
-            }
-
-            $process = Start-Process `
-              -FilePath $installer `
-              -Wait `
-              -PassThru
-
-            Write-Host "Instalador encerrado: $($process.ExitCode)"
-
+          if (-not (Test-Path $installer)) {
+            throw "Instalador do Claude não encontrado."
           }
 
-          # Esperar o Studio disponibilizar o MCP
-          $found = $false
-
-          for ($i = 1; $i -le 60; $i++) {
-            if (Test-Path $mcp) {
-              $found = $true
-              break
-            }
-
-            Start-Sleep -Seconds 5
-          }
-
-          if (!$found) {
-            throw "mcp.bat não apareceu. Instalação do Studio não confirmada."
-          }
-
-          $studio = Get-ChildItem `
-            "$robloxDir\Versions" `
-            -Filter "RobloxStudioBeta.exe" `
-            -File `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-
-          if (!$studio) {
-            throw "RobloxStudioBeta.exe não encontrado."
-          }
-
-          "ROBLOX_STUDIO=$($studio.FullName)" |
-            Out-File $env:GITHUB_ENV -Append -Encoding utf8
-
-          Write-Host "Roblox Studio: $($studio.FullName)"
-          Write-Host "MCP: $mcp"
-
-      # ==================================================
-      # 7. CONFIGURAR MCP AUTOMATICAMENTE NO CLAUDE
-      # ==================================================
-
-      - name: Configurar Roblox MCP no Claude
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $configDir = "$env:APPDATA\Claude"
-          $configFile = "$configDir\claude_desktop_config.json"
-          $mcpFile = "$env:LOCALAPPDATA\Roblox\mcp.bat"
-
-          if (!(Test-Path $mcpFile)) {
-            throw "Servidor MCP do Roblox não encontrado."
-          }
-
-          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-
-          if (Test-Path $configFile) {
-            try {
-              $config = Get-Content $configFile -Raw |
-                ConvertFrom-Json -AsHashtable
-            }
-            catch {
-              throw "JSON anterior do Claude inválido. Configuração não será sobrescrita."
-            }
-          }
-          else {
-            $config = @{}
-          }
-
-          if (!$config.ContainsKey("mcpServers") -or
-              $null -eq $config["mcpServers"]) {
-            $config["mcpServers"] = @{}
-          }
-
-          $config["mcpServers"]["Roblox_Studio"] = @{
-            command = "cmd.exe"
-            args = @(
-              "/c",
-              "cd /d %LOCALAPPDATA%\Roblox && .\mcp.bat"
-            )
-          }
-
-          $json = $config | ConvertTo-Json -Depth 100
-
-          Set-Content `
-            -Path $configFile `
-            -Value $json `
-            -Encoding utf8
-
-          # Validar arquivo
-          $validation = Get-Content $configFile -Raw |
-            ConvertFrom-Json
-
-          if (!$validation.mcpServers.Roblox_Studio) {
-            throw "Servidor MCP não foi gravado corretamente."
-          }
-
-          Write-Host "Roblox_Studio registrado no Claude."
-          Write-Host $configFile
-
-      # ==================================================
-      # 8. INSTALAR ANYDESK
-      # ==================================================
-
-      - name: Instalar AnyDesk
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $installer = "$env:TEMP\AnyDesk.exe"
-          $installDir = "${env:ProgramFiles(x86)}\AnyDesk"
-
-          Invoke-WebRequest `
-            -Uri "https://download.anydesk.com/AnyDesk.exe" `
-            -OutFile $installer
-
-          if (!(Test-Path $installer) -or
-              (Get-Item $installer).Length -lt 1MB) {
-            throw "Instalador AnyDesk inválido."
-          }
+          Write-Host "Iniciando instalação do Claude..."
 
           $process = Start-Process `
             -FilePath $installer `
-            -ArgumentList @(
-              "--install",
-              "`"$installDir`"",
-              "--start-with-win",
-              "--create-shortcuts",
-              "--silent"
-            ) `
-            -Wait `
-            -PassThru
+            -PassThru `
+            -Wait
 
-          Start-Sleep -Seconds 8
+          Write-Host "Instalador Claude finalizado."
+          Write-Host "Código de saída: $($process.ExitCode)"
 
-          $exe = Join-Path $installDir "AnyDesk.exe"
+          $claudePaths = @(
+            "$env:LOCALAPPDATA\Programs\Claude\Claude.exe",
+            "$env:LOCALAPPDATA\AnthropicClaude\Claude.exe"
+          )
 
-          if (!(Test-Path $exe)) {
-            $exe = "$env:ProgramFiles\AnyDesk\AnyDesk.exe"
+          $installed = $false
+
+          foreach ($path in $claudePaths) {
+            if (Test-Path $path) {
+              Write-Host "Claude encontrado: $path"
+              $installed = $true
+              break
+            }
           }
 
-          if (!(Test-Path $exe)) {
-            throw "AnyDesk não foi instalado. Código: $($process.ExitCode)"
+          if (-not $installed) {
+            Write-Warning "Não foi possível confirmar o caminho do Claude. Verifique a instalação pelo menu Iniciar."
           }
 
-          "ANYDESK_EXE=$exe" |
-            Out-File $env:GITHUB_ENV -Append -Encoding utf8
-
-          Write-Host "AnyDesk instalado."
-
-      # ==================================================
-      # 9. GERAR SENHA E OBTER ID REAL
-      # ==================================================
-
-      - name: Configurar acesso AnyDesk
+      # ==========================================
+      # 5. INSTALAR ROBLOX STUDIO
+      # ==========================================
+      - name: Instalar Roblox Studio
+        timeout-minutes: 20
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $installer = "$env:USERPROFILE\Downloads\RobloxStudioInstaller.exe"
 
-          $exe = $env:ANYDESK_EXE
-
-          & $exe --start
-          Start-Sleep -Seconds 10
-
-          # Gerar senha automaticamente
-          $bytes = New-Object byte[] 24
-
-          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-          $rng.GetBytes($bytes)
-          $rng.Dispose()
-
-          $password = [Convert]::ToBase64String($bytes).TrimEnd('=')
-
-          # Configurar acesso não supervisionado
-          $password | & $exe --set-password _unattended_access
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Falha ao configurar senha AnyDesk."
+          if (-not (Test-Path $installer)) {
+            throw "Instalador do Roblox Studio não encontrado."
           }
 
-          # Capturar ID pelo método batch
-          $batch = "$env:TEMP\get-anydesk-id.cmd"
+          Write-Host "Iniciando instalação do Roblox Studio..."
 
-          @"
-          @echo off
-          for /f "delims=" %%i in ('"$exe" --get-id') do echo %%i
-          "@ | Set-Content $batch -Encoding ASCII
+          $process = Start-Process `
+            -FilePath $installer `
+            -PassThru `
+            -Wait
 
-          $id = $null
+          Write-Host "Instalador Roblox finalizado."
+          Write-Host "Código de saída: $($process.ExitCode)"
 
-          for ($i = 1; $i -le 24; $i++) {
-            $output = & cmd.exe /c $batch 2>$null
+          $versions = "$env:LOCALAPPDATA\Roblox\Versions"
+          $studio = $null
 
-            $id = $output |
-              ForEach-Object { "$_".Trim() } |
-              Where-Object { $_ -match '^[0-9]{6,}$' } |
-              Select-Object -First 1
+          for ($i = 0; $i -lt 60; $i++) {
 
-            if ($id) {
+            if (Test-Path $versions) {
+              $studio = Get-ChildItem `
+                -Path $versions `
+                -Filter "RobloxStudioBeta.exe" `
+                -File `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            }
+
+            if ($studio) {
               break
             }
 
             Start-Sleep -Seconds 5
           }
 
-          if (!$id) {
-            throw "AnyDesk não forneceu um ID real."
-          }
-
-          # Salvar resumo
-          Add-Content $env:GITHUB_STEP_SUMMARY "## ACESSO ANYDESK"
-          Add-Content $env:GITHUB_STEP_SUMMARY ""
-          Add-Content $env:GITHUB_STEP_SUMMARY "**ID:** $id"
-          Add-Content $env:GITHUB_STEP_SUMMARY ""
-          Add-Content $env:GITHUB_STEP_SUMMARY "**SENHA:** $password"
-
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "             ANYDESK"
-          Write-Host "======================================"
-          Write-Host "ID: $id"
-          Write-Host "SENHA: $password"
-          Write-Host "======================================"
-
-      # ==================================================
-      # 10. ABRIR PROGRAMAS
-      # ==================================================
-
-      - name: Iniciar Claude e Roblox Studio
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          # Roblox Studio
-          if (Test-Path $env:ROBLOX_STUDIO) {
-            Start-Process -FilePath $env:ROBLOX_STUDIO
-            Write-Host "Roblox Studio iniciado."
+          if ($studio) {
+            Write-Host "ROBLOX STUDIO INSTALADO!"
+            Write-Host $studio.FullName
           }
           else {
-            Write-Warning "Roblox Studio não localizado."
+            throw "Não foi possível confirmar a instalação do Roblox Studio."
           }
 
-          Start-Sleep -Seconds 8
-
-          # Claude Desktop
-          if ($env:CLAUDE_APP_ID) {
-            Start-Process explorer.exe `
-              -ArgumentList "shell:AppsFolder\$env:CLAUDE_APP_ID"
-
-            Write-Host "Claude Desktop iniciado."
-          }
-          else {
-            Write-Warning "Claude não localizado para inicialização."
-          }
-
-      # ==================================================
-      # 11. RELATÓRIO DO AMBIENTE
-      # ==================================================
-
-      - name: Verificar ambiente
-        if: always()
+      # ==========================================
+      # 6. MANTER MÁQUINA ATIVA
+      # ==========================================
+      - name: Manter ativo
         shell: pwsh
         run: |
-          $root = "C:\RDP-Ultimate"
-          $report = "$root\Backup\report.txt"
+          $end = (Get-Date).AddMinutes(350)
 
-          @(
-            "RDP ULTIMATE",
-            "Data: $(Get-Date)",
-            "Runner: $env:RUNNER_NAME",
-            "Windows: $([Environment]::OSVersion.VersionString)",
-            "Claude: $env:CLAUDE_APP_ID",
-            "Roblox Studio: $env:ROBLOX_STUDIO",
-            "AnyDesk: $env:ANYDESK_EXE",
-            "MCP: $env:LOCALAPPDATA\Roblox\mcp.bat"
-          ) | Set-Content $report -Encoding utf8
+          Write-Host "Máquina virtual ativa."
 
-          Get-Content $report
-
-      # ==================================================
-      # 12. MANTER SESSÃO ATIVA
-      # ==================================================
-
-      - name: Manter Windows ativo
-        shell: pwsh
-        run: |
-          Write-Host "Windows pronto para uso."
-          Write-Host "A sessão ficará ativa por até 320 minutos."
-          Write-Host "Ao encerrar normalmente, o backup será iniciado."
-
-          for ($minute = 1; $minute -le 320; $minute++) {
+          while ((Get-Date) -lt $end) {
             Start-Sleep -Seconds 60
-
-            if (($minute % 5) -eq 0) {
-              Write-Host "Sessão ativa: $minute minutos."
-            }
           }
 
-          Write-Host "Tempo de sessão encerrado. Iniciando backup."
-
-      # ==================================================
-      # 13. BACKUP FINAL
-      # EXECUTA MESMO APÓS CANCELAMENTO, QUANDO POSSÍVEL
-      # ==================================================
-
-      - name: Preparar backup final
+      # ==========================================
+      # 7. PREPARAR BACKUP
+      # ==========================================
+      - name: Preparar backup dos downloads
         if: always()
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Continue"
+          $source = "$env:USERPROFILE\Downloads"
+          $backup = "$env:RUNNER_TEMP\pc-backup\Downloads"
 
-          $root = "C:\RDP-Ultimate"
-          $stage = "$root\Backup"
+          New-Item -ItemType Directory -Force -Path $backup | Out-Null
 
-          $downloads = "$env:USERPROFILE\Downloads"
-          $documents = "$env:USERPROFILE\Documents"
-          $claude = "$env:APPDATA\Claude"
-
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-          # Downloads
-          if (Test-Path $downloads) {
-            robocopy `
-              $downloads `
-              "$stage\Downloads" `
-              /E /R:1 /W:1
-
-            if ($LASTEXITCODE -ge 8) {
-              Write-Warning "Backup parcial dos Downloads."
-            }
+          if (Test-Path $source) {
+            Get-ChildItem -Path $source -Force |
+              Copy-Item -Destination $backup -Recurse -Force
           }
 
-          # Documentos e projetos
-          if (Test-Path $documents) {
-            robocopy `
-              $documents `
-              "$stage\Documents" `
-              /E /R:1 /W:1 `
-              /XD "$documents\WindowsPowerShell"
+          $files = Get-ChildItem $backup -Force
 
-            if ($LASTEXITCODE -ge 8) {
-              Write-Warning "Backup parcial dos Documentos."
-            }
+          if (-not $files) {
+            New-Item -ItemType File `
+              -Path "$backup\.keep" | Out-Null
           }
 
-          # Configuração Claude, incluindo MCP
-          if (Test-Path $claude) {
-            robocopy `
-              $claude `
-              "$stage\AppData\Roaming\Claude" `
-              /E /R:1 /W:1
+          Write-Host "Arquivos preparados para backup:"
+          Get-ChildItem $backup -Force |
+            Select-Object Name, Length
 
-            if ($LASTEXITCODE -ge 8) {
-              Write-Warning "Backup parcial da configuração Claude."
-            }
-          }
-
-          # Relatório
-          New-Item -ItemType Directory -Force -Path "$stage\Meta" | Out-Null
-
-          @(
-            "RDP Ultimate",
-            "Data: $(Get-Date)",
-            "Run ID: $env:GITHUB_RUN_ID",
-            "Repository: $env:GITHUB_REPOSITORY"
-          ) | Set-Content "$stage\Meta\backup-info.txt" -Encoding utf8
-
-          # Criar ZIP
-          $zip = "$root\rdp-ultimate-backup.zip"
-
-          if (Test-Path $zip) {
-            Remove-Item $zip -Force
-          }
-
-          Compress-Archive `
-            -Path "$stage\*" `
-            -DestinationPath $zip `
-            -CompressionLevel Optimal `
-            -Force
-
-          if (!(Test-Path $zip)) {
-            throw "Não foi possível criar o ZIP do backup."
-          }
-
-          Write-Host "Backup pronto."
-          Write-Host "Tamanho: $((Get-Item $zip).Length) bytes"
-
-      # ==================================================
-      # 14. PUBLICAR BACKUP PARA A PRÓXIMA EXECUÇÃO
-      # ==================================================
-
-      - name: Salvar backup para próxima execução
+      # ==========================================
+      # 8. SALVAR BACKUP NO GITHUB
+      # ==========================================
+      - name: Salvar downloads no GitHub
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rdp-ultimate-backup
-          path: C:\RDP-Ultimate\rdp-ultimate-backup.zip
+          name: pc-virtual-downloads
+          path: ${{ runner.temp }}/pc-backup/Downloads/
+          retention-days: 90
           if-no-files-found: warn
-          retention-days: 30
           
